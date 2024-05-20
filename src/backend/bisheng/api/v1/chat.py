@@ -15,11 +15,12 @@ from bisheng.chat.manager import ChatManager
 from bisheng.database.base import session_getter
 from bisheng.database.models.assistant import AssistantDao, AssistantStatus
 from bisheng.database.models.flow import Flow, FlowDao
+from bisheng.database.models.flow_version import FlowVersionDao
 from bisheng.database.models.message import ChatMessage, ChatMessageDao, ChatMessageRead
 from bisheng.graph.graph.base import Graph
 from bisheng.utils.logger import logger
 from bisheng.utils.util import get_cache_key
-from fastapi import APIRouter, HTTPException, WebSocket, WebSocketException, status
+from fastapi import APIRouter, HTTPException, Query, WebSocket, WebSocketException, status
 from fastapi.params import Depends
 from fastapi.responses import StreamingResponse
 from fastapi_jwt_auth import AuthJWT
@@ -86,6 +87,7 @@ def like_response(*, data: ChatInput, Authorize: AuthJWT = Depends()):
     with session_getter() as session:
         session.add(message)
         session.commit()
+    logger.info('k=s act=liked message_id={} liked={}', message_id, liked)
     return resp_200(message='操作成功')
 
 
@@ -144,7 +146,9 @@ def get_chatlist_list(*, Authorize: AuthJWT = Depends()):
 
 
 # 获取所有已上线的技能和助手
-@router.get('/chat/online', response_model=UnifiedResponseModel[List[FlowGptsOnlineList]], status_code=200)
+@router.get('/chat/online',
+            response_model=UnifiedResponseModel[List[FlowGptsOnlineList]],
+            status_code=200)
 def get_online_chat(*, Authorize: AuthJWT = Depends()):
     Authorize.jwt_required()
     payload = json.loads(Authorize.get_jwt_subject())
@@ -161,28 +165,22 @@ def get_online_chat(*, Authorize: AuthJWT = Depends()):
         flows = FlowDao.get_user_access_online_flows(user_id)
     for one in all_assistant:
         res.append(
-            FlowGptsOnlineList(
-                id=one.id.hex,
-                name=one.name,
-                desc=one.desc,
-                create_time=one.create_time,
-                update_time=one.update_time,
-                flow_type='assistant'
-            )
-        )
+            FlowGptsOnlineList(id=one.id.hex,
+                               name=one.name,
+                               desc=one.desc,
+                               create_time=one.create_time,
+                               update_time=one.update_time,
+                               flow_type='assistant'))
 
     # 获取用户可见的所有已上线的技能
     for one in flows:
         res.append(
-            FlowGptsOnlineList(
-                id=one.id.hex,
-                name=one.name,
-                desc=one.description,
-                create_time=one.create_time,
-                update_time=one.update_time,
-                flow_type='flow'
-            )
-        )
+            FlowGptsOnlineList(id=one.id.hex,
+                               name=one.name,
+                               desc=one.description,
+                               create_time=one.create_time,
+                               update_time=one.update_time,
+                               flow_type='flow'))
     res.sort(key=lambda x: x.update_time, reverse=True)
     return resp_200(data=res)
 
@@ -194,6 +192,7 @@ async def chat(
         websocket: WebSocket,
         t: Optional[str] = None,
         chat_id: Optional[str] = None,
+        version_id: Optional[int] = None,
         Authorize: AuthJWT = Depends(),
 ):
     """Websocket endpoint for chat."""
@@ -221,6 +220,8 @@ async def chat(
             graph_data = db_flow.data
         else:
             flow_data_key = 'flow_data_' + flow_id
+            if version_id:
+                flow_data_key = flow_data_key + '_' + str(version_id)
             if not flow_data_store.exists(flow_data_key) or str(
                     flow_data_store.hget(flow_data_key, 'status'),
                     'utf-8') != BuildStatus.SUCCESS.value:
@@ -256,18 +257,24 @@ async def chat(
 @router.post('/build/init/{flow_id}',
              response_model=UnifiedResponseModel[InitResponse],
              status_code=201)
-async def init_build(*, graph_data: dict, flow_id: str):
+async def init_build(*,
+                     graph_data: dict,
+                     flow_id: str,
+                     version_id: Optional[int] = Query(default=None, description='技能版本ID')):
     """Initialize the build by storing graph data and returning a unique session ID."""
     chat_id = graph_data.get('chat_id')
+    flow_data_key = 'flow_data_' + flow_id
+
     if chat_id:
         with session_getter() as session:
             graph_data = session.get(Flow, UUID(flow_id).hex).data
-
+    elif version_id:
+        flow_data_key = flow_data_key + '_' + str(version_id)
+        graph_data = FlowVersionDao.get_version_by_id(version_id).data
     try:
         if flow_id is None:
             raise ValueError('No ID provided')
         # Check if already building
-        flow_data_key = 'flow_data_' + flow_id
         if flow_data_store.hget(flow_data_key, 'status') == BuildStatus.IN_PROGRESS.value:
             return resp_200(InitResponse(flowId=flow_id))
 
@@ -286,10 +293,14 @@ async def init_build(*, graph_data: dict, flow_id: str):
 
 
 @router.get('/build/{flow_id}/status', response_model=UnifiedResponseModel[BuiltResponse])
-async def build_status(flow_id: str):
+async def build_status(flow_id: str,
+                       chat_id: Optional[str] = None,
+                       version_id: Optional[int] = Query(default=None, description='技能版本ID')):
     """Check the flow_id is in the flow_data_store."""
     try:
         flow_data_key = 'flow_data_' + flow_id
+        if not chat_id and version_id:
+            flow_data_key = flow_data_key + '_' + str(version_id)
         built = (flow_data_store.hget(flow_data_key, 'status') == BuildStatus.SUCCESS.value)
         return resp_200(BuiltResponse(built=built, ))
 
@@ -299,14 +310,18 @@ async def build_status(flow_id: str):
 
 
 @router.get('/build/stream/{flow_id}', response_class=StreamingResponse)
-async def stream_build(flow_id: str, chat_id: Optional[str] = None):
+async def stream_build(flow_id: str,
+                       chat_id: Optional[str] = None,
+                       version_id: Optional[int] = Query(default=None, description='技能版本ID')):
     """Stream the build process based on stored flow data."""
 
-    async def event_stream(flow_id, chat_id: str):
+    async def event_stream(flow_id, chat_id: str, version_id: Optional[int] = None):
         final_response = {'end_of_stream': True}
         artifacts = {}
         try:
             flow_data_key = 'flow_data_' + flow_id
+            if not chat_id and version_id:
+                flow_data_key = flow_data_key + '_' + str(version_id)
             if not flow_data_store.exists(flow_data_key):
                 error_message = 'Invalid session ID'
                 yield str(StreamData(event='error', data={'error': error_message}))
@@ -384,7 +399,8 @@ async def stream_build(flow_id: str, chat_id: Optional[str] = None):
             yield str(StreamData(event='message', data=final_response))
 
     try:
-        return StreamingResponse(event_stream(flow_id, chat_id), media_type='text/event-stream')
+        return StreamingResponse(event_stream(flow_id, chat_id, version_id),
+                                 media_type='text/event-stream')
     except Exception as exc:
         logger.error(exc)
         raise HTTPException(status_code=500, detail=str(exc))

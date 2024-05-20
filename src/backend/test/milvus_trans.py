@@ -172,7 +172,7 @@ def elastic_clean():
     url = 'http://192.168.106.109:9200/_stats'
     user_name = 'elastic'
     auth = 'MBDsrs5O_zHCE+12na3f'
-    del_url = 'http://192.168.106.116:9200/%s'
+    del_url = 'http://192.168.106.109:9200/%s'
     col = requests.get(url, auth=(user_name, auth)).json()
     for c in col.get('indices').keys():
         if c.startswith('tmp'):
@@ -184,6 +184,6 @@ def elastic_clean():
             print(x)
 
 
-milvus_clean()
-# elastic_clean()
+# milvus_clean()
+elastic_clean()
 # milvus_trans()
